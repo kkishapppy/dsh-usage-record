@@ -1,0 +1,4 @@
+# dsh-usage-record bundle: mount the Node half (event capture + records route).
+- insert:
+    - id: usage-record
+      name: 'dsh-usage-record'

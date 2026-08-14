@@ -1,0 +1,39 @@
+{
+  "name": "dsh-usage-record",
+  "description": "每轮提问的 LLM 用量记录：左侧栏按钮 + 抽屉面板，列出每轮的 tokens/耗时/工具调用，点击跳转到对应会话",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.mjs",
+  "exports": {
+    ".": {
+      "default": "./lib/index.mjs"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "cordis": "^4.0.0-rc.7",
+    "react": "^18.2.0"
+  },
+  "scripts": {
+    "build": "tsdown --config ./tsdown.config.ts"
+  },
+  "devDependencies": {
+    "tsdown": "0.22.2"
+  },
+  "license": "MIT"
+}
