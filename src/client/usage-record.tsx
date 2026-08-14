@@ -761,6 +761,9 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
 
   if (!rail.visible) return null
 
+  // 当前提问序号（scroll-spy 高亮的那条，1 起）；无则显示 —/总数
+  const currentIdx = currentId === null ? 0 : rail.ticks.findIndex((t) => t.id === currentId) + 1
+
   return (
     <>
       <div
@@ -841,17 +844,18 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
           })}
         </div>
       </div>
-      {bgLoading && (
-        <div
-          style={{
-            position: 'fixed', left: rail.left, top: rail.top + rail.height + 6,
-            fontSize: 10, color: 'var(--dsw-alias-label-caption)', zIndex: 900,
-            pointerEvents: 'none', whiteSpace: 'nowrap',
-          }}
-        >
-          {t('rail.loading', { n: bgBatches })}
-        </div>
-      )}
+      {/* 计数：当前/总数（纯数字 x/x，低调，主题弱化色，始终显示在轨道正下方，微左移与轨道视觉对齐） */}
+      <div
+        style={{
+          position: 'fixed', left: rail.left - 4, top: rail.top + rail.height + 6,
+          fontSize: 10, lineHeight: 1.4,
+          color: 'var(--dsw-alias-label-tertiary)',
+          fontVariantNumeric: 'tabular-nums',
+          pointerEvents: 'none', whiteSpace: 'nowrap', zIndex: 900,
+        }}
+      >
+        {currentIdx > 0 ? `${currentIdx}/${rail.ticks.length}` : `—/${rail.ticks.length}`}
+      </div>
       {tipTick !== undefined && (
         <div
           style={{
