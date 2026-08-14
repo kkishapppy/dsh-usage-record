@@ -46,17 +46,17 @@ interface RailState {
   ticks: Tick[]
 }
 
-const LINE_H = 3
-const GAP = 14
+const LINE_H = 4
+const GAP = 17
 const MAX_VISIBLE = 15
-const SIDE_INSET = 4
-const BASE_W = 12
+const SIDE_INSET = 6
+const BASE_W = 16
 /** 鱼眼放大参数：正中最粗宽、最大高、影响半径（σ 越小放大越聚焦，邻线保持小线，视觉区分清晰不误触）。 */
-const MAX_W = 36
-const MAX_H = 10
-const SIGMA = 10
+const MAX_W = 46
+const MAX_H = 13
+const SIGMA = 12
 /** 内容区上下留白：边缘横线放大后不被裁剪。 */
-const PAD = 8
+const PAD = 10
 
 const QUESTIONS_PATH = '/plugins/dsh-usage-record/questions'
 
@@ -164,23 +164,39 @@ function railLayout(ticks: Tick[]): RailState {
 
 /** 当前高亮的行（用于点击其它区域时清除）。 */
 let highlightedRow: HTMLElement | null = null
-let highlightedStyles: { outline: string; background: string } | null = null
+let highlightedStyles: { outline: string; outlineOffset: string; background: string } | null = null
+/** 高亮行的消息 id（清除时按 id 重新找当前节点——流式/虚拟化可能重建过行节点）。 */
+let highlightedId: string | null = null
 /** 跳转目标的待钉高亮 id：滚动稳定/锁定校正后重新定位高亮（行节点可能被 React 重建、或停在视口边缘）。 */
 let pendingHighlightId: string | null = null
 
 function clearHighlight(): void {
-  if (highlightedRow !== null && highlightedStyles !== null) {
-    highlightedRow.style.outline = highlightedStyles.outline
-    highlightedRow.style.background = highlightedStyles.background
+  // 恢复保存的节点 + 按 id 重新查找当前节点（节点可能已被 React 重建）
+  const restore = (row: HTMLElement | null): void => {
+    if (row === null || highlightedStyles === null) return
+    row.style.outline = highlightedStyles.outline
+    row.style.outlineOffset = highlightedStyles.outlineOffset
+    row.style.background = highlightedStyles.background
   }
+  restore(highlightedRow)
+  if (highlightedId !== null) restore(findRow(highlightedId))
   highlightedRow = null
   highlightedStyles = null
+  highlightedId = null
 }
 
 function markHighlight(row: HTMLElement): void {
   clearHighlight()
   highlightedRow = row
-  highlightedStyles = { outline: row.style.outline, background: row.style.background }
+  highlightedStyles = {
+    outline: row.style.outline,
+    outlineOffset: row.style.outlineOffset,
+    background: row.style.background,
+  }
+  // 从 data-chat-anchor-key（形如 "13:input-message<id>"）提取消息 id
+  const key = row.dataset.chatAnchorKey ?? ''
+  const m = key.match(/input-message(.+)$/)
+  highlightedId = m !== null ? m[1] : null
   row.style.outline = '2px solid var(--dsw-alias-accent, #4cc2ff)'
   row.style.outlineOffset = '-2px'
   row.style.background = 'rgba(76, 194, 255, .12)'
@@ -934,6 +950,7 @@ export function apply(ctx: Context): void {
   } catch { /* 忽略 */ }
   document.addEventListener('click', () => {
     pendingHighlightId = null
+    cancelJumpLock()
     clearHighlight()
   }, true)
   document.addEventListener('click', (e) => {
