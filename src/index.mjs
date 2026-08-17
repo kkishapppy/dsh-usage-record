@@ -94,13 +94,16 @@ export function apply(ctx, config = {}) {
   try { mkdirSync(questionsDir, { recursive: true }) } catch { /* 只读时跳过 */ }
   const questionsFile = (sid) => join(questionsDir, `${sid}.json`)
 
-  /** Read the persisted question index for a session, if present. */
+  /** Read the persisted question index for a session, if present.
+   *  Returns { questions, lastSeq }（lastSeq = 已索引的最大事件 seq，缺失时为 null）。 */
   function readQuestionIndex(sid) {
     try {
       const f = questionsFile(sid)
       if (!existsSync(f)) return null
       const raw = JSON.parse(readFileSync(f, 'utf8'))
-      if (raw && Array.isArray(raw.questions)) return raw.questions
+      if (raw && Array.isArray(raw.questions)) {
+        return { questions: raw.questions, lastSeq: typeof raw.lastSeq === 'number' ? raw.lastSeq : null }
+      }
     } catch { /* 损坏索引：回退全量扫描 */ }
     return null
   }
@@ -108,13 +111,19 @@ export function apply(ctx, config = {}) {
   /** Append a new question to the persisted index (write-time indexing). */
   function appendQuestionIndex(sid, question) {
     try {
-      const list = readQuestionIndex(sid) ?? []
+      const index = readQuestionIndex(sid)
+      const list = index?.questions ?? []
       if (list.some((q) => q.id === question.id)) return
       list.push(question)
+      const lastSeq = Math.max(
+        typeof index?.lastSeq === 'number' ? index.lastSeq : 0,
+        typeof question.seq === 'number' ? question.seq : 0,
+      )
       writeFileSync(questionsFile(sid), JSON.stringify({
         sessionId: sid,
         updatedAt: new Date().toISOString(),
         count: list.length,
+        lastSeq: lastSeq > 0 ? lastSeq : undefined,
         questions: list,
       }, null, 2), 'utf8')
     } catch (error) {
@@ -240,12 +249,36 @@ export function apply(ctx, config = {}) {
     },
   })
 
+  /** 从事件数组提取提问（user/message + source.kind==='user'）。
+   *  @param fromSeq - 只提取 seq > fromSeq 的事件（增量）；0/undefined = 全量。 */
+  function extractQuestions(events, fromSeq = 0) {
+    const out = []
+    if (!Array.isArray(events)) return out
+    for (const event of events) {
+      if (!event || event.type !== 'user/message') continue
+      const seq = typeof event.seq === 'number' ? event.seq : 0
+      if (fromSeq > 0 && seq <= fromSeq) continue
+      const data = event.data ?? {}
+      if (data.source?.kind !== 'user') continue
+      if (typeof data.id !== 'string') continue
+      const text = contentText(data.content).replace(/\s+/g, ' ').trim()
+      if (text === '') continue
+      out.push({
+        seq: seq > 0 ? seq : undefined,
+        turn: typeof data.turn === 'number' ? data.turn : undefined,
+        id: data.id,
+        text: text.slice(0, 200),
+        time: typeof event.time === 'number' ? event.time : 0,
+      })
+    }
+    return out
+  }
+
   /** 从会话日志提取全部提问（缓存未命中/初始化时全量扫描）。
    *  优先读内存态 session.log（attach 中的会话）；冷会话（未 attach/被 LRU 淘汰）
    *  从磁盘读日志（sessionPersistence.loadStored），保证历史提问不丢。 */
-  async function scanQuestions(sessionId) {
-    const out = []
-    if (sessionId === '') return out
+  async function scanQuestions(sessionId, fromSeq = 0) {
+    if (sessionId === '') return []
     let events = null
     // 1) 内存态：attach 中的会话
     if (typeof ctx.sessions?.get === 'function') {
@@ -259,34 +292,33 @@ export function apply(ctx, config = {}) {
         if (stored && Array.isArray(stored.events)) events = stored.events
       } catch { /* 磁盘读取失败：返回已收集的增量 */ }
     }
-    if (events !== null) {
-      for (const event of events) {
-        if (!event || event.type !== 'user/message') continue
-        const data = event.data ?? {}
-        if (data.source?.kind !== 'user') continue
-        if (typeof data.id !== 'string') continue
-        const text = contentText(data.content).replace(/\s+/g, ' ').trim()
-        if (text === '') continue
-        out.push({
-          seq: typeof event.seq === 'number' ? event.seq : undefined,
-          turn: typeof data.turn === 'number' ? data.turn : undefined,
-          id: data.id,
-          text: text.slice(0, 200),
-          time: typeof event.time === 'number' ? event.time : 0,
-        })
-      }
-    }
-    return out
+    return extractQuestions(events, fromSeq)
   }
 
-  /** 取某会话提问列表（持久化索引优先 → 缓存 → 全量扫描回填索引）。 */
+  /** 取某会话提问列表（持久化索引优先 → 增量修补 → 全量扫描回填索引）。 */
   async function questionsFor(sessionId) {
     const cached = questionCache.get(sessionId)
     if (cached !== undefined && cached.list.length > 0) return cached
     // 1) 持久化索引（写时维护）：冷会话免全量扫描
     const indexed = readQuestionIndex(sessionId)
-    if (indexed !== null && indexed.length > 0) {
-      const entry = { list: indexed, version: indexed.length }
+    if (indexed !== null && indexed.questions.length > 0) {
+      const entry = { list: indexed.questions, version: indexed.questions.length }
+      // 1b) 增量修补：索引可能漏掉的事件（插件热重载窗口/索引写失败）——
+      //     仅当内存 session.log 存在更高 seq 时才增量提取，绝不全量重扫
+      let newOnes = []
+      try {
+        newOnes = await scanQuestions(sessionId, indexed.lastSeq ?? 0)
+      } catch { /* 增量失败不影响已有索引 */ }
+      if (newOnes.length > 0) {
+        const seen = new Set(entry.list.map((q) => q.id))
+        for (const q of newOnes) {
+          if (seen.has(q.id)) continue
+          seen.add(q.id)
+          entry.list.push(q)
+          appendQuestionIndex(sessionId, q)
+        }
+        entry.version = entry.list.length
+      }
       questionCache.set(sessionId, entry)
       return entry
     }
@@ -296,10 +328,12 @@ export function apply(ctx, config = {}) {
     questionCache.set(sessionId, entry)
     if (list.length > 0) {
       try {
+        const lastSeq = list.reduce((max, q) => Math.max(max, typeof q.seq === 'number' ? q.seq : 0), 0)
         writeFileSync(questionsFile(sessionId), JSON.stringify({
           sessionId,
           updatedAt: new Date().toISOString(),
           count: list.length,
+          lastSeq: lastSeq > 0 ? lastSeq : undefined,
           questions: list,
         }, null, 2), 'utf8')
       } catch { /* 索引写失败不影响返回 */ }

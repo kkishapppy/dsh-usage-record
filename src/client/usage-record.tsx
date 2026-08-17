@@ -151,10 +151,12 @@ function scanDomQuestions(): Tick[] {
 /** 布局：轨道定高（最多 MAX_VISIBLE 条可见），超出内容在轨道内上下滚动。
  *  left 锚定聊天真实滚动容器（findScroller，overflow auto/scroll 祖先，结构稳定）：
  *  不能用 [data-chat-flow] 内容列（max-width 居中会偏右），也不用
- *  [data-conversation-scroll]（F12 布局切换时其 rect 会飘到页面最左工作区）。 */
-function railLayout(ticks: Tick[]): RailState {
+ *  [data-conversation-scroll]（F12 布局切换时其 rect 会飘到页面最左工作区）。
+ *  @param allowEmpty - 提问数据未到（fetch 进行中）时也渲染空轨道骨架：
+ *  容器立即出现，数据到达后填充 tick——避免"每次加载都是最后才冒出来"的观感。 */
+function railLayout(ticks: Tick[], allowEmpty = false): RailState {
   const hidden: RailState = { visible: false, left: 0, top: 0, height: 0, contentH: 0, gap: GAP, lineH: LINE_H, ticks: [] }
-  if (ticks.length === 0) return hidden
+  if (ticks.length === 0 && !allowEmpty) return hidden
   const flow = document.querySelector('[data-chat-flow]')
   if (flow === null) return hidden
   const port = findScroller(flow) ?? flow.closest('[data-conversation-scroll]') ?? flow
@@ -170,8 +172,11 @@ function railLayout(ticks: Tick[]): RailState {
   const budgetH = Math.max(1, portRect.height - 24)
 
   const step = LINE_H + GAP
-  const contentH = Math.max(1, ticks.length * step - GAP + PAD * 2)
-  const height = Math.min(contentH, MAX_VISIBLE * step - GAP + PAD * 2)
+  // 空骨架：保留最小可点击轨道（PAD 上下留白），避免 0 高度布局抖动
+  const contentH = ticks.length > 0 ? Math.max(1, ticks.length * step - GAP + PAD * 2) : PAD * 2
+  const height = ticks.length > 0
+    ? Math.min(contentH, MAX_VISIBLE * step - GAP + PAD * 2)
+    : PAD * 2
   const centerH = visibleH > 60 ? visibleH : budgetH
 
   return {
@@ -864,7 +869,7 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
       // 布局变化才重渲染（避免流式期间无谓渲染）。
       // 轻量签名：只比较几何值与 ticks 规模/首尾 id（O(1)），
       // 不做 JSON.stringify 全量序列化（大会话时每次滚动都 O(n) 卡顿）。
-      const next = railLayout(questions)
+      const next = railLayout(questions, sessionIdRef.current !== undefined && sessionIdRef.current !== '')
       const key = layoutSignature(next)
       if (key !== lastLayout) {
         lastLayout = key
