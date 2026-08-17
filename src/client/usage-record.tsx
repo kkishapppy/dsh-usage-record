@@ -474,10 +474,17 @@ function loadUntilVisible(id: string, onDone: () => void): void {
     } else if (btn === null) {
       // 按钮不在 DOM：消息流虚拟化窗口可能把它卸载了（滚动位置在下方）。
       // 滚动到消息流顶部让按钮重新渲染，再继续轮询。
-      const flow = document.querySelector('[data-chat-flow]')
-      const scroller = flow !== null ? findScroller(flow) : null
-      if (scroller !== null && scroller.scrollTop > 0) {
-        scroller.scrollTo({ top: 0, behavior: 'auto' })
+      // 用户滚动保护：用户正在滚动/刚滚完（<1.5s）时绝不抢滚动位置，只静默等待
+      // ——否则加载循环会把视图反复拽回顶部（"锁定到第一个提问，往下滚自动跳回"）。
+      if (Date.now() - lastUserScrollAt > 1500) {
+        const flow = document.querySelector('[data-chat-flow]')
+        const scroller = flow !== null ? findScroller(flow) : null
+        if (scroller !== null && scroller.scrollTop > 0) {
+          programmaticScroll = true
+          scroller.scrollTo({ top: 0, behavior: 'auto' })
+        }
+      } else {
+        delay = 500 // 用户还在滚动：慢速重试，绝不抢位置
       }
     }
     // 每 25 轮更新一次进度显示
@@ -512,6 +519,10 @@ let jumpLock = 0
 let jumpLockId: string | null = null
 let jumpScroller: HTMLElement | null = null
 let userScrolledAway = false
+/** 最近一次用户滚动时间戳：加载循环只在用户停止滚动一段时间后才允许抢滚动位置（修复"往下滚被拽回顶部"）。 */
+let lastUserScrollAt = 0
+/** 程序化滚动标记：循环自己的 scrollTo 不算用户滚动。 */
+let programmaticScroll = false
 
 function cancelJumpLock(): void {
   if (jumpLock !== 0) {
@@ -1117,9 +1128,14 @@ export function apply(ctx: Context): void {
     jumpAtPoint(e.clientX, e.clientY)
   }, true)
   // 用户主动滚动（滚轮/触摸/键盘）→ 解锁跳转锁定与流式 stick，不再对抗拉回
-  document.addEventListener('wheel', () => { userScrolledAway = true; cancelActiveStick() }, true)
-  document.addEventListener('touchstart', () => { userScrolledAway = true; cancelActiveStick() }, true)
-  document.addEventListener('keydown', () => { userScrolledAway = true; cancelActiveStick() }, true)
+  document.addEventListener('wheel', () => { userScrolledAway = true; lastUserScrollAt = Date.now(); cancelActiveStick() }, true)
+  document.addEventListener('touchstart', () => { userScrolledAway = true; lastUserScrollAt = Date.now(); cancelActiveStick() }, true)
+  document.addEventListener('keydown', () => { userScrolledAway = true; lastUserScrollAt = Date.now(); cancelActiveStick() }, true)
+  // 滚动条拖动也计入用户滚动（捕获阶段覆盖聊天容器；程序化滚动不算）
+  document.addEventListener('scroll', () => {
+    if (!programmaticScroll) lastUserScrollAt = Date.now()
+    programmaticScroll = false
+  }, true)
   // 鼠标移动也算用户主动操作：命令运行期间若只是移动鼠标，应立即释放 stick，避免视图在光标下反复被拉回（鼠标“漂移”感）
   document.addEventListener('mousemove', () => {
     if (activeStick !== 0 || jumpLock !== 0) {
