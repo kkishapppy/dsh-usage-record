@@ -869,6 +869,9 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
       // 布局变化才重渲染（避免流式期间无谓渲染）。
       // 轻量签名：只比较几何值与 ticks 规模/首尾 id（O(1)），
       // 不做 JSON.stringify 全量序列化（大会话时每次滚动都 O(n) 卡顿）。
+      // 空骨架期间（提问数据未到）布局只算一次：签名以 '|0|||0'（n=0）结尾时
+      // 直接跳过，避免流式输出高频触发 getBoundingClientRect reflow。
+      if (questions.length === 0 && lastLayout.endsWith('|0|||0')) return
       const next = railLayout(questions, sessionIdRef.current !== undefined && sessionIdRef.current !== '')
       const key = layoutSignature(next)
       if (key !== lastLayout) {

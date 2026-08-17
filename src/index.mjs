@@ -274,6 +274,40 @@ export function apply(ctx, config = {}) {
     return out
   }
 
+  /** 尾部增量提取：事件按 seq 升序 append，新提问几乎都在尾部。
+   *  从尾部反向找到第一个 seq <= fromSeq 的边界，只处理其后的事件——
+   *  O(新增) 而非 O(全量)。回扫上限 5000 条防异常乱序（无 seq 事件混排）。 */
+  function extractTailQuestions(events, fromSeq) {
+    const out = []
+    if (!Array.isArray(events) || events.length === 0) return out
+    let i = events.length - 1
+    let scanned = 0
+    while (i >= 0 && scanned < 5000) {
+      const e = events[i]
+      const seq = typeof e?.seq === 'number' ? e.seq : 0
+      if (seq <= fromSeq) break
+      i--
+      scanned++
+    }
+    for (let j = i + 1; j < events.length; j++) {
+      const event = events[j]
+      if (!event || event.type !== 'user/message') continue
+      const data = event.data ?? {}
+      if (data.source?.kind !== 'user') continue
+      if (typeof data.id !== 'string') continue
+      const text = contentText(data.content).replace(/\s+/g, ' ').trim()
+      if (text === '') continue
+      out.push({
+        seq: typeof event.seq === 'number' ? event.seq : undefined,
+        turn: typeof data.turn === 'number' ? data.turn : undefined,
+        id: data.id,
+        text: text.slice(0, 200),
+        time: typeof event.time === 'number' ? event.time : 0,
+      })
+    }
+    return out
+  }
+
   /** 从会话日志提取全部提问（缓存未命中/初始化时全量扫描）。
    *  优先读内存态 session.log（attach 中的会话）；冷会话（未 attach/被 LRU 淘汰）
    *  从磁盘读日志（sessionPersistence.loadStored），保证历史提问不丢。 */
@@ -298,7 +332,9 @@ export function apply(ctx, config = {}) {
   /** 取某会话提问列表（持久化索引优先 → 增量修补 → 全量扫描回填索引）。 */
   async function questionsFor(sessionId) {
     const cached = questionCache.get(sessionId)
-    if (cached !== undefined && cached.list.length > 0) return cached
+    // 空会话也走缓存（cached 存在即返回）：新提问由 session/event 写时维护更新
+    // 同一 entry 对象（q.list.push + version++），无需重查；避免每次请求重跑增量。
+    if (cached !== undefined) return cached
     // 1) 持久化索引（写时维护）：冷会话免全量扫描
     const indexed = readQuestionIndex(sessionId)
     if (indexed !== null && indexed.questions.length > 0) {
@@ -312,7 +348,8 @@ export function apply(ctx, config = {}) {
         try {
           const live = typeof ctx.sessions?.get === 'function' ? ctx.sessions.get(sessionId) : undefined
           if (live && Array.isArray(live.log) && live.log.length > 0) {
-            newOnes = extractQuestions(live.log, indexed.lastSeq)
+            // 尾部反向增量（O(新增)）——绝不全量遍历几十万事件的 session.log
+            newOnes = extractTailQuestions(live.log, indexed.lastSeq)
           }
         } catch { /* 增量失败不影响已有索引 */ }
       }
