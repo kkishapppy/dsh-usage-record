@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const name = 'usage-record'
-export const inject = ['webServer', 'sessions']
+export const inject = ['webServer', 'sessions', 'sessionPersistence']
 
 export const RECORDS_PATH = '/plugins/dsh-usage-record/records'
 export const QUESTIONS_PATH = '/plugins/dsh-usage-record/questions'
@@ -40,6 +40,25 @@ export function apply(ctx, config = {}) {
   const pendingTools = new Map()
   let saveTimer = null
 
+  /**
+   * 提问缓存（新提问推送）：sessionId -> { list: Question[], version }。
+   * version 每次新增提问 +1；长轮询等待者按 (sessionId, version) 唤醒。
+   */
+  const questionCache = new Map()
+  /** 长轮询等待者：sessionId -> Set<resolve 回调> */
+  const questionWaiters = new Map()
+
+  /** 唤醒某会话所有长轮询等待者（新提问到达时调用）。 */
+  function wakeQuestionWaiters(sid) {
+    const waiters = questionWaiters.get(sid)
+    if (!waiters || waiters.size === 0) return
+    for (const resolve of waiters) {
+      if (resolve._timer !== undefined) clearTimeout(resolve._timer)
+      resolve()
+    }
+    questionWaiters.delete(sid)
+  }
+
   function load() {
     try {
       if (!existsSync(storeFile)) return
@@ -68,6 +87,41 @@ export function apply(ctx, config = {}) {
     }, 1000)
   }
 
+  // ---- persistent question index -----------------------------------------
+  // The question list is appended to on write (session/event), so cold
+  // sessions never need a full loadStored scan: read the index file instead.
+  const questionsDir = join(dataDir, 'questions')
+  try { mkdirSync(questionsDir, { recursive: true }) } catch { /* 只读时跳过 */ }
+  const questionsFile = (sid) => join(questionsDir, `${sid}.json`)
+
+  /** Read the persisted question index for a session, if present. */
+  function readQuestionIndex(sid) {
+    try {
+      const f = questionsFile(sid)
+      if (!existsSync(f)) return null
+      const raw = JSON.parse(readFileSync(f, 'utf8'))
+      if (raw && Array.isArray(raw.questions)) return raw.questions
+    } catch { /* 损坏索引：回退全量扫描 */ }
+    return null
+  }
+
+  /** Append a new question to the persisted index (write-time indexing). */
+  function appendQuestionIndex(sid, question) {
+    try {
+      const list = readQuestionIndex(sid) ?? []
+      if (list.some((q) => q.id === question.id)) return
+      list.push(question)
+      writeFileSync(questionsFile(sid), JSON.stringify({
+        sessionId: sid,
+        updatedAt: new Date().toISOString(),
+        count: list.length,
+        questions: list,
+      }, null, 2), 'utf8')
+    } catch (error) {
+      console.error('[usage-record] question index write failed:', error)
+    }
+  }
+
   ctx.on('session/event', (session, event) => {
     if (!event || typeof event !== 'object') return
     const sid = session?.id ?? session?.sessionId
@@ -75,6 +129,32 @@ export function apply(ctx, config = {}) {
     const t = typeof event.time === 'number' ? event.time : Date.now()
     const data = event.data ?? {}
     switch (event.type) {
+      case 'user/message': {
+        // 权威的新提问信号（不依赖客户端 DOM 虚拟化渲染）：
+        // 增量维护提问缓存并唤醒长轮询等待者；同时落盘到持久化索引
+        // （写时索引，冷会话读取免全量扫描；带 seq 供导航轨精确跳转）。
+        if (data.source?.kind === 'user' && typeof data.id === 'string') {
+          const text = contentText(data.content).replace(/\s+/g, ' ').trim()
+          if (text !== '') {
+            const question = {
+              seq: typeof event.seq === 'number' ? event.seq : undefined,
+              turn: typeof data.turn === 'number' ? data.turn : undefined,
+              time: t,
+              id: data.id,
+              text: text.slice(0, 200),
+            }
+            const q = questionCache.get(sid) ?? { list: [], version: 0 }
+            if (!q.list.some((item) => item.id === data.id)) {
+              q.list.push(question)
+              q.version += 1
+              questionCache.set(sid, q)
+              wakeQuestionWaiters(sid)
+              appendQuestionIndex(sid, question)
+            }
+          }
+        }
+        break
+      }
       case 'step/start': {
         openSteps.set(sid, {
           turn: data.turn,
@@ -160,7 +240,74 @@ export function apply(ctx, config = {}) {
     },
   })
 
-  /** 全部提问：从会话日志提取 user/message（source.kind === 'user'）。 */
+  /** 从会话日志提取全部提问（缓存未命中/初始化时全量扫描）。
+   *  优先读内存态 session.log（attach 中的会话）；冷会话（未 attach/被 LRU 淘汰）
+   *  从磁盘读日志（sessionPersistence.loadStored），保证历史提问不丢。 */
+  async function scanQuestions(sessionId) {
+    const out = []
+    if (sessionId === '') return out
+    let events = null
+    // 1) 内存态：attach 中的会话
+    if (typeof ctx.sessions?.get === 'function') {
+      const session = ctx.sessions.get(sessionId)
+      if (session && Array.isArray(session.log)) events = session.log
+    }
+    // 2) 冷会话：从磁盘读
+    if (events === null && typeof ctx.sessionPersistence?.loadStored === 'function') {
+      try {
+        const stored = await ctx.sessionPersistence.loadStored(sessionId)
+        if (stored && Array.isArray(stored.events)) events = stored.events
+      } catch { /* 磁盘读取失败：返回已收集的增量 */ }
+    }
+    if (events !== null) {
+      for (const event of events) {
+        if (!event || event.type !== 'user/message') continue
+        const data = event.data ?? {}
+        if (data.source?.kind !== 'user') continue
+        if (typeof data.id !== 'string') continue
+        const text = contentText(data.content).replace(/\s+/g, ' ').trim()
+        if (text === '') continue
+        out.push({
+          seq: typeof event.seq === 'number' ? event.seq : undefined,
+          turn: typeof data.turn === 'number' ? data.turn : undefined,
+          id: data.id,
+          text: text.slice(0, 200),
+          time: typeof event.time === 'number' ? event.time : 0,
+        })
+      }
+    }
+    return out
+  }
+
+  /** 取某会话提问列表（持久化索引优先 → 缓存 → 全量扫描回填索引）。 */
+  async function questionsFor(sessionId) {
+    const cached = questionCache.get(sessionId)
+    if (cached !== undefined && cached.list.length > 0) return cached
+    // 1) 持久化索引（写时维护）：冷会话免全量扫描
+    const indexed = readQuestionIndex(sessionId)
+    if (indexed !== null && indexed.length > 0) {
+      const entry = { list: indexed, version: indexed.length }
+      questionCache.set(sessionId, entry)
+      return entry
+    }
+    // 2) 无索引：全量扫描并回填持久化索引（历史会话一次性补建）
+    const list = await scanQuestions(sessionId)
+    const entry = { list, version: list.length }
+    questionCache.set(sessionId, entry)
+    if (list.length > 0) {
+      try {
+        writeFileSync(questionsFile(sessionId), JSON.stringify({
+          sessionId,
+          updatedAt: new Date().toISOString(),
+          count: list.length,
+          questions: list,
+        }, null, 2), 'utf8')
+      } catch { /* 索引写失败不影响返回 */ }
+    }
+    return entry
+  }
+
+  /** 全部提问：从缓存（实时增量）或会话日志提取 user/message（source.kind === 'user'）。 */
   const disposeQuestions = ctx.webServer.register({
     kind: 'exact',
     path: QUESTIONS_PATH,
@@ -168,27 +315,59 @@ export function apply(ctx, config = {}) {
       try {
         const url = new URL(req.url ?? '/', 'http://dsh.internal')
         const sessionId = url.searchParams.get('sessionId') ?? ''
-        const out = []
-        if (sessionId !== '' && typeof ctx.sessions?.get === 'function') {
-          const session = ctx.sessions.get(sessionId)
-          if (session && Array.isArray(session.log)) {
-            for (const event of session.log) {
-              if (!event || event.type !== 'user/message') continue
-              const data = event.data ?? {}
-              if (data.source?.kind !== 'user') continue
-              if (typeof data.id !== 'string') continue
-              const text = contentText(data.content).replace(/\s+/g, ' ').trim()
-              if (text === '') continue
-              out.push({
-                id: data.id,
-                text: text.slice(0, 200),
-                time: typeof event.time === 'number' ? event.time : 0,
-              })
-            }
-          }
-        }
+        const entry = await questionsFor(sessionId)
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
-        res.end(JSON.stringify({ questions: out }))
+        res.end(JSON.stringify({ questions: entry.list, version: entry.version }))
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ error: message }))
+      }
+    },
+  })
+
+  /**
+   * 提问长轮询：?sessionId=..&v=<上次版本>。
+   * 版本未变则挂起（最长 ~25s）；新提问到达（version 增加）立即返回最新列表。
+   * 客户端据此实现"事件驱动"刷新——新提问不再依赖 DOM 虚拟化渲染。
+   */
+  const disposeQuestionsWait = ctx.webServer.register({
+    kind: 'exact',
+    path: '/plugins/dsh-usage-record/questions/wait',
+    handler: async (req, res) => {
+      try {
+        const url = new URL(req.url ?? '/', 'http://dsh.internal')
+        const sessionId = url.searchParams.get('sessionId') ?? ''
+        const rawV = url.searchParams.get('v') ?? '0'
+        const lastV = Number.isFinite(Number(rawV)) ? Number(rawV) : 0
+        if (sessionId === '') {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ questions: [], version: 0, changed: false }))
+          return
+        }
+        const entry = await questionsFor(sessionId)
+        if (entry.version > lastV) {
+          // 已有新提问：立即返回
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ questions: entry.list, version: entry.version, changed: true }))
+          return
+        }
+        // 挂起等待：新提问到达（wakeQuestionWaiters）或 25s 超时
+        await new Promise((resolve) => {
+          const waiters = questionWaiters.get(sessionId) ?? new Set()
+          waiters.add(resolve)
+          questionWaiters.set(sessionId, waiters)
+          const timer = setTimeout(() => {
+            waiters.delete(resolve)
+            if (waiters.size === 0) questionWaiters.delete(sessionId)
+            resolve()
+          }, 25000)
+          resolve._timer = timer
+        })
+        const latest = await questionsFor(sessionId)
+        const changed = latest.version > lastV
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ questions: latest.list, version: latest.version, changed }))
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
@@ -201,5 +380,14 @@ export function apply(ctx, config = {}) {
     clearTimeout(saveTimer)
     disposeRecords()
     disposeQuestions()
+    disposeQuestionsWait()
+    // 唤醒所有残留等待者（插件卸载时避免挂起连接）
+    for (const waiters of questionWaiters.values()) {
+      for (const resolve of waiters) {
+        if (resolve._timer !== undefined) clearTimeout(resolve._timer)
+        resolve()
+      }
+    }
+    questionWaiters.clear()
   }
 }

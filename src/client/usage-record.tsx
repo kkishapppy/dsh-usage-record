@@ -49,6 +49,11 @@ interface RailState {
 const LINE_H = 4
 const GAP = 17
 const MAX_VISIBLE = 15
+/** 后台预加载批数上限：预热绝大部分历史（250 批 ≈ 12500 条消息 ≈ 60+ 万事件，
+ *  覆盖本机最大会话（~35 万事件 / 70+ 提问）的全部历史；极端超大会话剩余
+ *  由 loadUntilVisible 按需加载。2026-08-16 从 60 调大：60 批只覆盖 ~20 条
+ *  提问，70 提问级大会话的早期提问点击时仍要逐批现加载（"卡一下"）。 */
+const PRELOAD_BATCH_CAP = 250
 const SIDE_INSET = 6
 const BASE_W = 16
 /** 鱼眼放大参数：正中最粗宽、最大高、影响半径（σ 越小放大越聚焦，邻线保持小线，视觉区分清晰不误触）。 */
@@ -69,6 +74,10 @@ let lastLayout = ''
 let lastUserRows = -1
 /** 聊天滚动容器（滚动跟随用）。 */
 let chatScroller: HTMLElement | null = null
+/** 提问版本号（长轮询用）：服务端每次新增提问 +1。 */
+let questionsVersion = 0
+/** 组件挂载时注入的 currentId setter（jump 后强制同步 rail 高亮，不等 scroll-spy）。 */
+let currentIdSetter: ((v: string | null) => void) | null = null
 
 /** 滚动跟随：高亮离视口垂直中心最近的那条提问（scroll-spy 居中判定）。 */
 function computeCurrentId(scroller: HTMLElement, setCurrentId: (v: string | null) => void): void {
@@ -94,15 +103,30 @@ function computeCurrentId(scroller: HTMLElement, setCurrentId: (v: string | null
   setCurrentId(prev => (prev === current ? prev : current))
 }
 
-/** 从会话日志服务端路由拉取全部提问。 */
-async function fetchQuestions(sessionId: string | undefined): Promise<Tick[]> {
+/** 提问列表客户端缓存（sessionId -> { ticks, at }）：切换回已看过的会话秒显，
+ *  避免每次切会话都重新 fetch + 重建轨道（后端 scanQuestions 每次全量遍历会话日志）。
+ *  5 分钟内复用；新提问由长轮询（/questions/wait）触发 refreshTick 刷新，不依赖此缓存过期。 */
+const questionsCache = new Map<string, { ticks: Tick[]; at: number }>()
+const QUESTIONS_CACHE_TTL_MS = 5 * 60 * 1000
+
+/** 从会话日志服务端路由拉取全部提问（带客户端缓存）。
+ *  @param force - 长轮询确认有新提问时传入 true，绕过 5 分钟缓存；
+ *  否则新提问要等缓存过期才出现，导航轨看起来"不更新"。 */
+async function fetchQuestions(sessionId: string | undefined, force = false): Promise<Tick[]> {
   if (sessionId === undefined || sessionId === '') return []
+  const cached = questionsCache.get(sessionId)
+  if (!force && cached !== undefined && Date.now() - cached.at < QUESTIONS_CACHE_TTL_MS) {
+    return cached.ticks
+  }
   try {
     const res = await fetch(`${QUESTIONS_PATH}?sessionId=${encodeURIComponent(sessionId)}`, { headers: { accept: 'application/json' } })
     if (!res.ok) return []
-    const json = (await res.json()) as { questions?: Array<{ id: string; text: string; time: number }> }
+    const json = (await res.json()) as { questions?: Array<{ id: string; text: string; time: number }>; version?: number }
     if (!json || !Array.isArray(json.questions)) return []
-    return json.questions.map((q, i) => ({ id: q.id, index: i + 1, text: q.text }))
+    if (typeof json.version === 'number') questionsVersion = json.version
+    const ticks = json.questions.map((q, i) => ({ id: q.id, index: i + 1, text: q.text }))
+    questionsCache.set(sessionId, { ticks, at: Date.now() })
+    return ticks
   } catch {
     return []
   }
@@ -160,6 +184,66 @@ function railLayout(ticks: Tick[]): RailState {
     lineH: LINE_H,
     ticks,
   }
+}
+
+/** 布局轻量签名：几何值 + ticks 规模/首尾 id/最后 index（O(1) 比较，替代 JSON.stringify 全量序列化）。
+ *  index 是连续序号，末位 index 变化能捕获"中间插入/删除"这类首尾不变但内容已变的场景。 */
+function layoutSignature(s: RailState): string {
+  const ticks = s.ticks
+  const n = ticks.length
+  const first = n > 0 ? ticks[0].id : ''
+  const last = n > 1 ? ticks[n - 1].id : ''
+  const lastIndex = n > 0 ? ticks[n - 1].index : 0
+  return `${s.visible ? 1 : 0}|${s.left}|${s.top}|${s.height}|${s.contentH}|${n}|${first}|${last}|${lastIndex}`
+}
+
+/** 可视区虚拟化渲染：只渲染 [scrollTop - overscan, scrollTop + height + overscan] 内的 tick。
+ *  保证命中测试/高亮/鱼眼只对可见元素生效（与全量渲染视觉一致，滚动时按需补渲染）。
+ *  注意：不能引用组件内部函数（lineCenter 等闭包），全部自包含计算。 */
+const TICK_OVERSCAN = 80 // px：可视区上下各多渲染 80px，滚动时新元素提前就位
+function renderTicks(
+  rail: RailState,
+  scrollTop: number,
+  mouseY: number | null,
+  active: number | null,
+  currentId: string | null,
+  step: number,
+): ReactNode[] {
+  const out: ReactNode[] = []
+  const lineCenter = (i: number): number => i * step + rail.lineH / 2
+  const from = Math.max(0, Math.floor((scrollTop - TICK_OVERSCAN - PAD) / step))
+  const to = Math.min(rail.ticks.length, Math.ceil((scrollTop + rail.height + TICK_OVERSCAN - PAD) / step))
+  for (let i = from; i < to; i++) {
+    const tick = rail.ticks[i]
+    const center = lineCenter(i)
+    const dist = mouseY === null ? Infinity : Math.abs(center - mouseY)
+    const k = fisheye(dist)
+    const w = BASE_W + (MAX_W - BASE_W) * k
+    const h = rail.lineH + (MAX_H - rail.lineH) * k
+    const isActive = active === tick.index
+    const isCurrent = tick.id === currentId
+    // 放大后钳制在留白区内（边缘横线不会被裁剪、不越界）
+    const top = Math.max(PAD, Math.min(PAD + center - h / 2, rail.contentH - PAD - h))
+    out.push(
+      <div
+        key={tick.id}
+        data-question-tick={tick.id}
+        style={{
+          position: 'absolute', left: 0,
+          top,
+          width: w, height: h,
+          borderRadius: Math.max(2, h / 2),
+          background: isActive
+            ? 'var(--dsw-alias-accent, #4cc2ff)'
+            : isCurrent
+              ? '#7dd3fc'
+              : 'var(--dsh-alias-border-l2, rgba(128,128,128,.45))',
+          boxShadow: isCurrent ? '0 0 5px var(--dsw-alias-accent, #4cc2ff)' : 'none',
+        }}
+      />,
+    )
+  }
+  return out
 }
 
 /** 当前高亮的行（用于点击其它区域时清除）。 */
@@ -301,7 +385,7 @@ function startBackgroundPreload(total = Infinity): void {
     btn.click()
     bgPreloadBatches += 1
     onBgPreloadChange?.(true, bgPreloadBatches)
-    if (bgPreloadBatches >= 60) { // 上限保护
+    if (bgPreloadBatches >= PRELOAD_BATCH_CAP) { // 上限保护：只预热近端历史，更远的点击时 loadUntilVisible 兜底
       stopBackgroundPreload()
       return
     }
@@ -319,7 +403,11 @@ function startBackgroundPreload(total = Infinity): void {
           noGrowth += 1
           if (noGrowth >= 2) { stopBackgroundPreload(); return } // 连续两批无增长 = 已到最早
         }
-        bgPreloadTimer = window.setTimeout(tick, 120)
+        // 节奏控制：前 10 批快速预热（近端历史），之后 250ms/批（2026-08-16
+        // 从 450ms 调快：大会话预加载总时长 ~24s → ~14s，缩短"首次点击早期
+        // 提问要等"的窗口；每批 3-6MB 历史 + 渲染仍留有余量不卡页面）。
+        const slow = bgPreloadBatches >= 10 ? 250 : 120
+        bgPreloadTimer = window.setTimeout(tick, slow)
         return
       }
       bgPreloadTimer = window.setTimeout(() => waitBatch(left - 1), 150)
@@ -337,7 +425,9 @@ function stopBackgroundPreload(): void {
   }
 }
 
-/** 持续点击"加载更早"直到目标行出现（或超时），然后回调。 */
+/** 持续点击"加载更早"直到目标行出现（或超时），然后回调。
+ *  加载期间通过 onBgPreloadChange 显示进度（复用"加载历史中…（n 批）"指示），
+ *  让用户看到跳转正在加载而不是"没反应"。 */
 function loadUntilVisible(id: string, onDone: () => void): void {
   if (findRow(id) !== null) {
     onDone()
@@ -350,32 +440,64 @@ function loadUntilVisible(id: string, onDone: () => void): void {
     return
   }
   activeLoads.set(id, onDone)
+  onBgPreloadChange?.(true, 0) // 显示"加载历史中…"反馈
+  let lastReported = 0
+  const startTime = Date.now()
   const tick = (tries: number): void => {
     if (findRow(id) !== null) {
       const done = activeLoads.get(id)
       activeLoads.delete(id)
       console.log('[usage-record] loadUntilVisible FOUND after', tries, 'tries')
+      onBgPreloadChange?.(false, 0)
       done?.()
       return
     }
-    if (tries >= 80) { // 10s 上限（125ms/轮）
+    if (Date.now() - startTime > 30000) { // 30s 上限：容忍大会话长距离加载（几十批 × 每批 ~1s）
       activeLoads.delete(id)
-      console.warn('[usage-record] loadUntilVisible TIMEOUT (10s), row never appeared:', id)
+      console.warn('[usage-record] loadUntilVisible TIMEOUT (30s), row never appeared:', id)
+      onBgPreloadChange?.(false, 0)
       return
     }
     // 按钮可点才点（加载中/暂缺不盲点，避免空转）
     const btn = findLoadOlderBtn()
-    if (tries % 4 === 0) {
-      console.log('[usage-record] loadUntilVisible try', tries, { btn: btn !== null, disabled: btn?.disabled ?? false, rows: countUserRows() })
+    let delay = 100
+    if (btn !== null && !btn.disabled) {
+      btn.click()
+      delay = 300 // 点击后等渲染完成再检查（比 100ms 盲轮更有效）
+    } else if (btn !== null && btn.disabled) {
+      delay = 500 // 上一批还在加载：等它完成，不空转
+    } else if (btn === null) {
+      // 按钮不在 DOM：消息流虚拟化窗口可能把它卸载了（滚动位置在下方）。
+      // 滚动到消息流顶部让按钮重新渲染，再继续轮询。
+      const flow = document.querySelector('[data-chat-flow]')
+      const scroller = flow !== null ? findScroller(flow) : null
+      if (scroller !== null && scroller.scrollTop > 0) {
+        scroller.scrollTo({ top: 0, behavior: 'auto' })
+      }
     }
-    if (btn !== null && !btn.disabled) btn.click()
-    window.setTimeout(() => tick(tries + 1), 125)
+    // 每 25 轮更新一次进度显示
+    if (tries % 25 === 0) {
+      const rows = countUserRows()
+      if (rows !== lastReported) {
+        lastReported = rows
+        onBgPreloadChange?.(true, Math.round(tries / 25))
+      }
+    }
+    window.setTimeout(() => tick(tries + 1), delay)
   }
   tick(0)
 }
 
 /** 流式锁定定时器（新跳转必须取消旧的，否则旧锁定会把视图拉回旧目标）。 */
 let activeStick = 0
+
+/** 取消流式 stick：用户任何主动滚动/点击/键盘操作后立即释放，不再把视图拉回目标行。 */
+function cancelActiveStick(): void {
+  if (activeStick !== 0) {
+    window.clearInterval(activeStick)
+    activeStick = 0
+  }
+}
 
 /** 跳转锁定期：官方 at-bottom 跟随（流式/新消息到达时 toBottom）会把视图拉回底部，
  *  跳转后 holdMs 内持续监控，目标行偏离视口中心超 60px 就重新定位（用户主动滚动则解锁）。
@@ -477,10 +599,7 @@ function jumpToQuestion(id: string, instant = false): void {
   lastJump = { id, at: now }
   console.log('[usage-record] jumpToQuestion', id.slice(0, 8), { instant })
   // 取消上一次跳转遗留的流式锁定与跳转锁定
-  if (activeStick !== 0) {
-    window.clearInterval(activeStick)
-    activeStick = 0
-  }
+  cancelActiveStick()
   cancelJumpLock()
   const row = findRow(id)
   if (row === null) {
@@ -512,12 +631,22 @@ function jumpToQuestion(id: string, instant = false): void {
   }
 
   applyScroll(row, true)
+  // 强制同步 rail 高亮到目标提问：scroll-spy 的"最近中心"判定在边界
+  // （第一个/最后一个提问无法滚到视口居中）会选中相邻行，导致 rail 高亮
+  // 不跟随跳转——这里直接指定 currentId，后续用户滚动再交给 scroll-spy 校正。
+  currentIdSetter?.(id)
   // 立即高亮 + 滚动稳定后（smooth 动画/锁定校正结束）重新钉高亮：
   // 长距离滚动期间行可能被 React 重建（高亮丢失）或停在视口边缘（高亮不可见）
   markHighlight(row)
   scheduleRehighlight(id, 700)
   let stickTicks = 0
   const stick = window.setInterval(() => {
+    if (userScrolledAway) {
+      // 用户开始主动滚动/触摸/按键：立即释放，streaming 期间也不再对抗拉回
+      window.clearInterval(stick)
+      if (activeStick === stick) activeStick = 0
+      return
+    }
     if (document.querySelector('[data-streaming]') === null) {
       window.clearInterval(stick)
       if (activeStick === stick) activeStick = 0
@@ -626,12 +755,14 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
   // 事件驱动刷新：会话切换（sessions 订阅回调）+ 初次挂载
   useEffect(() => {
     sessionChangeNotifier = () => setRefreshTick(t => t + 1)
+    currentIdSetter = (v) => setCurrentId(v)
     onBgPreloadChange = (loading, batches) => {
       setBgLoading(loading)
       setBgBatches(batches)
     }
     return () => {
       sessionChangeNotifier = null
+      currentIdSetter = null
       onBgPreloadChange = null
       stopBackgroundPreload()
       cancelJumpLock()
@@ -640,14 +771,14 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
   }, [])
 
   // 查询（仅在 refreshTick 变化或新提问出现时执行）
-  const doRefresh = async (): Promise<void> => {
+  const doRefresh = async (force = false): Promise<void> => {
     const sessionId = sessionIdRef.current
     console.log('[usage-record] refresh session:', sessionId)
     let ticks: Tick[]
     if (sessionId === undefined || sessionId === '') {
       ticks = scanDomQuestions()
     } else {
-      ticks = await fetchQuestions(sessionId)
+      ticks = await fetchQuestions(sessionId, force)
       if (ticks.length === 0) ticks = scanDomQuestions()
     }
     console.log('[usage-record] refresh ticks:', ticks.length)
@@ -656,8 +787,47 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
   }
   useEffect(() => {
     let alive = true
-    if (alive) void doRefresh()
+    if (alive) void doRefresh(true)
     return () => { alive = false }
+  }, [refreshTick])
+
+  // 提问长轮询（事件驱动的新提问推送，不依赖 DOM 虚拟化渲染）：
+  // 常驻一个 /questions/wait 挂起请求，服务端有新 user/message 立即返回；
+  // changed 时触发 doRefresh。会话切换/组件卸载时重建循环。
+  useEffect(() => {
+    let alive = true
+    let loopTimer = 0
+    const loop = async (): Promise<void> => {
+      if (!alive) return
+      const sessionId = sessionIdRef.current
+      if (sessionId === undefined || sessionId === '') {
+        // 无会话：稍后重试
+        loopTimer = window.setTimeout(() => { void loop() }, 2000)
+        return
+      }
+      try {
+        const res = await fetch(
+          `${QUESTIONS_PATH}/wait?sessionId=${encodeURIComponent(sessionId)}&v=${questionsVersion}`,
+          { headers: { accept: 'application/json' } },
+        )
+        if (!alive) return
+        if (res.ok) {
+          const json = (await res.json()) as { changed?: boolean; version?: number }
+          if (json.changed === true && typeof json.version === 'number' && json.version > questionsVersion) {
+            questionsVersion = json.version
+            setRefreshTick(t => t + 1)
+          }
+        }
+      } catch {
+        // 网络/服务错误：稍后重试（长轮询期间后端重启等）
+      }
+      if (alive) loopTimer = window.setTimeout(() => { void loop() }, 500)
+    }
+    void loop()
+    return () => {
+      alive = false
+      clearTimeout(loopTimer)
+    }
   }, [refreshTick])
 
   // 布局 + 新提问检测 + 滚动跟随：内容/窗口变化时重算；用户提问行数增加时触发刷新
@@ -691,9 +861,11 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
         cancelAnimationFrame(spyRaf)
         spyRaf = requestAnimationFrame(() => { if (alive) computeCurrentId(scroller, setCurrentId) })
       }
-      // 布局变化才重渲染（避免流式期间无谓渲染）
+      // 布局变化才重渲染（避免流式期间无谓渲染）。
+      // 轻量签名：只比较几何值与 ticks 规模/首尾 id（O(1)），
+      // 不做 JSON.stringify 全量序列化（大会话时每次滚动都 O(n) 卡顿）。
       const next = railLayout(questions)
-      const key = JSON.stringify(next)
+      const key = layoutSignature(next)
       if (key !== lastLayout) {
         lastLayout = key
         setRail(next)
@@ -711,11 +883,12 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
     }
     update()
     const flowObserver = new MutationObserver(schedule)
-    const bodyObserver = new MutationObserver(schedule)
     const flow = document.querySelector('[data-chat-flow]')
     if (flow !== null) flowObserver.observe(flow, { childList: true, subtree: true })
-    // body 深层变化也触发（F12/布局切换会重建 DOM 子树，仅 childList 可能漏报）
-    bodyObserver.observe(document.body, { childList: true, subtree: true })
+    // 不再观察整个 body：大会话流式输出时 body 每秒变几十次，全量观察会让
+    // update() 高频执行（每次含 railLayout + DOM 查询），拖慢导航轨和整个页面。
+    // flow 容器内的变化已覆盖消息增删/虚拟化重建；F12/布局切换等结构变化由
+    // resizeObserver + scroll 事件兜底（update 每次都会重新 findScroller）。
     window.addEventListener('resize', schedule)
     // 尺寸变化立即重算（F12 打开/关闭、侧边栏开合、内容列宽度变化）
     const resizeObserver = new ResizeObserver(schedule)
@@ -729,7 +902,6 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
       if (chatScroller !== null) chatScroller.removeEventListener('scroll', onChatScroll)
       chatScroller = null
       flowObserver.disconnect()
-      bodyObserver.disconnect()
       resizeObserver.disconnect()
       window.removeEventListener('resize', schedule)
     }
@@ -829,35 +1001,9 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
         }}
       >
         <div style={{ position: 'relative', height: rail.contentH, boxSizing: 'border-box', paddingTop: PAD, paddingBottom: PAD }}>
-          {rail.ticks.map((tick, i) => {
-            const center = lineCenter(i)
-            const dist = mouseY === null ? Infinity : Math.abs(center - mouseY)
-            const k = fisheye(dist)
-            const w = BASE_W + (MAX_W - BASE_W) * k
-            const h = rail.lineH + (MAX_H - rail.lineH) * k
-            const isActive = active === tick.index
-            const isCurrent = tick.id === currentId
-            // 放大后钳制在留白区内（边缘横线不会被裁剪、不越界）
-            const top = Math.max(PAD, Math.min(PAD + center - h / 2, rail.contentH - PAD - h))
-            return (
-              <div
-                key={tick.id}
-                data-question-tick={tick.id}
-                style={{
-                  position: 'absolute', left: 0,
-                  top,
-                  width: w, height: h,
-                  borderRadius: Math.max(2, h / 2),
-                  background: isActive
-                    ? 'var(--dsw-alias-accent, #4cc2ff)'
-                    : isCurrent
-                      ? '#7dd3fc'
-                      : 'var(--dsw-alias-border-l2, rgba(128,128,128,.45))',
-                  boxShadow: isCurrent ? '0 0 5px var(--dsw-alias-accent, #4cc2ff)' : 'none',
-                }}
-              />
-            )
-          })}
+          {/* 虚拟化：只渲染可视区 ± 溢出带内的 tick（轨道高 ~500px、step ~21px ≈ 30 条可见；
+              全部渲染在几千条提问时会拖慢每次重渲染——鼠标移动/滚动都全量重算 fisheye）。 */}
+          {renderTicks(rail, scrollTop, mouseY, active, currentId, step)}
         </div>
       </div>
       {/* 计数：当前/总数（纯数字 x/x，低调，主题弱化色，始终显示在轨道正下方，微左移与轨道视觉对齐） */}
@@ -913,15 +1059,18 @@ export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'usage-record: dictionaries')
   // 包装 session.history RPC：官方 loadOlder 每批只拉 maxMessages: 50，
   // 跳到很老的提问要十几批（十几秒）。包装后每批最多 HISTORY_BATCH 条 → 1 批到位。
+  // 只放大带 beforeSeq 的“翻旧页”请求；不带 beforeSeq 的首次打开/断线补页保持
+  // 官方默认 50，否则当前会话会被 3000 条历史（几十 MB）堵住，实时回答无法渲染。
   // 默认 3000；若担心响应体积可调小（服务端按 turn/start 切页，无硬上限）。
   try {
     if (!historyPatched) {
       const api = (ctx.workspaces as unknown as { api?: { sessions?: { history?: (req: Record<string, unknown>) => Promise<unknown> } } } | undefined)?.api
       if (api?.sessions && typeof api.sessions.history === 'function') {
         const orig = api.sessions.history
-        api.sessions.history = (req: Record<string, unknown>) => orig({ ...req, maxMessages: HISTORY_BATCH })
+        api.sessions.history = (req: Record<string, unknown>) =>
+          orig((req as { beforeSeq?: unknown }).beforeSeq === undefined ? req : { ...req, maxMessages: HISTORY_BATCH })
         historyPatched = true
-        console.log(`[usage-record] history RPC patched: batch 50 -> ${HISTORY_BATCH}`)
+        console.log(`[usage-record] history RPC patched (loadOlder only): batch -> ${HISTORY_BATCH}`)
       }
     }
   } catch (error) {
@@ -951,20 +1100,28 @@ export function apply(ctx: Context): void {
   document.addEventListener('click', () => {
     pendingHighlightId = null
     cancelJumpLock()
+    cancelActiveStick()
     clearHighlight()
   }, true)
   document.addEventListener('click', (e) => {
     jumpAtPoint(e.clientX, e.clientY)
   }, true)
-  // 用户主动滚动（滚轮/触摸/键盘）→ 解锁跳转锁定，不再对抗拉回
-  document.addEventListener('wheel', () => { userScrolledAway = true }, true)
-  document.addEventListener('touchstart', () => { userScrolledAway = true }, true)
-  document.addEventListener('keydown', () => { userScrolledAway = true }, true)
+  // 用户主动滚动（滚轮/触摸/键盘）→ 解锁跳转锁定与流式 stick，不再对抗拉回
+  document.addEventListener('wheel', () => { userScrolledAway = true; cancelActiveStick() }, true)
+  document.addEventListener('touchstart', () => { userScrolledAway = true; cancelActiveStick() }, true)
+  document.addEventListener('keydown', () => { userScrolledAway = true; cancelActiveStick() }, true)
+  // 鼠标移动也算用户主动操作：命令运行期间若只是移动鼠标，应立即释放 stick，避免视图在光标下反复被拉回（鼠标“漂移”感）
+  document.addEventListener('mousemove', () => {
+    if (activeStick !== 0 || jumpLock !== 0) {
+      userScrolledAway = true
+      cancelActiveStick()
+    }
+  }, true)
   ctx.slots.inject('conversation.input.dock', () =>
     ctx.slots.register({
       name: 'conversation.input.dock',
       id: 'usage-record',
-      order: 10,
+      order: 30,
       locale: NS,
     }, QuestionRail))
 }
