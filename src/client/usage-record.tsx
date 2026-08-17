@@ -151,12 +151,10 @@ function scanDomQuestions(): Tick[] {
 /** 布局：轨道定高（最多 MAX_VISIBLE 条可见），超出内容在轨道内上下滚动。
  *  left 锚定聊天真实滚动容器（findScroller，overflow auto/scroll 祖先，结构稳定）：
  *  不能用 [data-chat-flow] 内容列（max-width 居中会偏右），也不用
- *  [data-conversation-scroll]（F12 布局切换时其 rect 会飘到页面最左工作区）。
- *  @param allowEmpty - 提问数据未到（fetch 进行中）时也渲染空轨道骨架：
- *  容器立即出现，数据到达后填充 tick——避免"每次加载都是最后才冒出来"的观感。 */
-function railLayout(ticks: Tick[], allowEmpty = false): RailState {
+ *  [data-conversation-scroll]（F12 布局切换时其 rect 会飘到页面最左工作区）。 */
+function railLayout(ticks: Tick[]): RailState {
   const hidden: RailState = { visible: false, left: 0, top: 0, height: 0, contentH: 0, gap: GAP, lineH: LINE_H, ticks: [] }
-  if (ticks.length === 0 && !allowEmpty) return hidden
+  if (ticks.length === 0) return hidden
   const flow = document.querySelector('[data-chat-flow]')
   if (flow === null) return hidden
   const port = findScroller(flow) ?? flow.closest('[data-conversation-scroll]') ?? flow
@@ -172,11 +170,8 @@ function railLayout(ticks: Tick[], allowEmpty = false): RailState {
   const budgetH = Math.max(1, portRect.height - 24)
 
   const step = LINE_H + GAP
-  // 空骨架：保留最小可点击轨道（PAD 上下留白），避免 0 高度布局抖动
-  const contentH = ticks.length > 0 ? Math.max(1, ticks.length * step - GAP + PAD * 2) : PAD * 2
-  const height = ticks.length > 0
-    ? Math.min(contentH, MAX_VISIBLE * step - GAP + PAD * 2)
-    : PAD * 2
+  const contentH = Math.max(1, ticks.length * step - GAP + PAD * 2)
+  const height = Math.min(contentH, MAX_VISIBLE * step - GAP + PAD * 2)
   const centerH = visibleH > 60 ? visibleH : budgetH
 
   return {
@@ -474,17 +469,10 @@ function loadUntilVisible(id: string, onDone: () => void): void {
     } else if (btn === null) {
       // 按钮不在 DOM：消息流虚拟化窗口可能把它卸载了（滚动位置在下方）。
       // 滚动到消息流顶部让按钮重新渲染，再继续轮询。
-      // 用户滚动保护：用户正在滚动/刚滚完（<1.5s）时绝不抢滚动位置，只静默等待
-      // ——否则加载循环会把视图反复拽回顶部（"锁定到第一个提问，往下滚自动跳回"）。
-      if (Date.now() - lastUserScrollAt > 1500) {
-        const flow = document.querySelector('[data-chat-flow]')
-        const scroller = flow !== null ? findScroller(flow) : null
-        if (scroller !== null && scroller.scrollTop > 0) {
-          programmaticScroll = true
-          scroller.scrollTo({ top: 0, behavior: 'auto' })
-        }
-      } else {
-        delay = 500 // 用户还在滚动：慢速重试，绝不抢位置
+      const flow = document.querySelector('[data-chat-flow]')
+      const scroller = flow !== null ? findScroller(flow) : null
+      if (scroller !== null && scroller.scrollTop > 0) {
+        scroller.scrollTo({ top: 0, behavior: 'auto' })
       }
     }
     // 每 25 轮更新一次进度显示
@@ -519,10 +507,6 @@ let jumpLock = 0
 let jumpLockId: string | null = null
 let jumpScroller: HTMLElement | null = null
 let userScrolledAway = false
-/** 最近一次用户滚动时间戳：加载循环只在用户停止滚动一段时间后才允许抢滚动位置（修复"往下滚被拽回顶部"）。 */
-let lastUserScrollAt = 0
-/** 程序化滚动标记：循环自己的 scrollTo 不算用户滚动。 */
-let programmaticScroll = false
 
 function cancelJumpLock(): void {
   if (jumpLock !== 0) {
@@ -880,10 +864,7 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
       // 布局变化才重渲染（避免流式期间无谓渲染）。
       // 轻量签名：只比较几何值与 ticks 规模/首尾 id（O(1)），
       // 不做 JSON.stringify 全量序列化（大会话时每次滚动都 O(n) 卡顿）。
-      // 空骨架期间（提问数据未到）布局只算一次：签名以 '|0|||0'（n=0）结尾时
-      // 直接跳过，避免流式输出高频触发 getBoundingClientRect reflow。
-      if (questions.length === 0 && lastLayout.endsWith('|0|||0')) return
-      const next = railLayout(questions, sessionIdRef.current !== undefined && sessionIdRef.current !== '')
+      const next = railLayout(questions)
       const key = layoutSignature(next)
       if (key !== lastLayout) {
         lastLayout = key
@@ -943,10 +924,8 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
   // 轨道可见即后台预加载（不等鼠标入轨）：聊天时悄悄把全部旧历史加载完，
   // 之后点击任意横线都是已渲染 → 立即跳转，消除"首次点击要等几秒"的延迟。
   // 依赖 questions：会话切换（提问列表变化）也会重新触发预加载。
-  // 骨架阶段（questions 为空，fetch 未回）不预加载：total=0 会误判"已全部渲染"，
-  // 且可能点一次 load-older 白白加载一批历史——数据到达后本 effect 会重跑。
   useEffect(() => {
-    if (rail.visible && questions.length > 0) {
+    if (rail.visible) {
       const t = window.setTimeout(() => startBackgroundPreload(questions.length), 400)
       return () => { clearTimeout(t) }
     }
@@ -977,7 +956,7 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
     <>
       <div
         data-question-rail=""
-        onMouseEnter={() => { setMouseOnRail(true); if (rail.ticks.length > 0) startBackgroundPreload(rail.ticks.length) }}
+        onMouseEnter={() => { setMouseOnRail(true); startBackgroundPreload(rail.ticks.length) }}
         ref={(el) => {
           railElRef.current = el
           // 元素级原生点击兜底：直接命中横线元素（与 rect 判定视觉一致）
@@ -1128,14 +1107,9 @@ export function apply(ctx: Context): void {
     jumpAtPoint(e.clientX, e.clientY)
   }, true)
   // 用户主动滚动（滚轮/触摸/键盘）→ 解锁跳转锁定与流式 stick，不再对抗拉回
-  document.addEventListener('wheel', () => { userScrolledAway = true; lastUserScrollAt = Date.now(); cancelActiveStick() }, true)
-  document.addEventListener('touchstart', () => { userScrolledAway = true; lastUserScrollAt = Date.now(); cancelActiveStick() }, true)
-  document.addEventListener('keydown', () => { userScrolledAway = true; lastUserScrollAt = Date.now(); cancelActiveStick() }, true)
-  // 滚动条拖动也计入用户滚动（捕获阶段覆盖聊天容器；程序化滚动不算）
-  document.addEventListener('scroll', () => {
-    if (!programmaticScroll) lastUserScrollAt = Date.now()
-    programmaticScroll = false
-  }, true)
+  document.addEventListener('wheel', () => { userScrolledAway = true; cancelActiveStick() }, true)
+  document.addEventListener('touchstart', () => { userScrolledAway = true; cancelActiveStick() }, true)
+  document.addEventListener('keydown', () => { userScrolledAway = true; cancelActiveStick() }, true)
   // 鼠标移动也算用户主动操作：命令运行期间若只是移动鼠标，应立即释放 stick，避免视图在光标下反复被拉回（鼠标“漂移”感）
   document.addEventListener('mousemove', () => {
     if (activeStick !== 0 || jumpLock !== 0) {
