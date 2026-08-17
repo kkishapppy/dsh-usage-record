@@ -303,12 +303,19 @@ export function apply(ctx, config = {}) {
     const indexed = readQuestionIndex(sessionId)
     if (indexed !== null && indexed.questions.length > 0) {
       const entry = { list: indexed.questions, version: indexed.questions.length }
-      // 1b) 增量修补：索引可能漏掉的事件（插件热重载窗口/索引写失败）——
-      //     仅当内存 session.log 存在更高 seq 时才增量提取，绝不全量重扫
+      // 1b) 增量修补：仅限【attach 中的会话 + 新格式索引（有 lastSeq）】——
+      //     只从内存 session.log 提取更高 seq 的事件（热重载窗口/索引写失败漏掉
+      //     的新提问），绝不触发 loadStored 全量解压（冷会话事件只会在 attach 时
+      //     产生且写时索引已覆盖；旧格式索引视为完整，不做全量提取去重）。
       let newOnes = []
-      try {
-        newOnes = await scanQuestions(sessionId, indexed.lastSeq ?? 0)
-      } catch { /* 增量失败不影响已有索引 */ }
+      if (indexed.lastSeq !== null) {
+        try {
+          const live = typeof ctx.sessions?.get === 'function' ? ctx.sessions.get(sessionId) : undefined
+          if (live && Array.isArray(live.log) && live.log.length > 0) {
+            newOnes = extractQuestions(live.log, indexed.lastSeq)
+          }
+        } catch { /* 增量失败不影响已有索引 */ }
+      }
       if (newOnes.length > 0) {
         const seen = new Set(entry.list.map((q) => q.id))
         for (const q of newOnes) {

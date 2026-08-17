@@ -929,8 +929,10 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
   // 轨道可见即后台预加载（不等鼠标入轨）：聊天时悄悄把全部旧历史加载完，
   // 之后点击任意横线都是已渲染 → 立即跳转，消除"首次点击要等几秒"的延迟。
   // 依赖 questions：会话切换（提问列表变化）也会重新触发预加载。
+  // 骨架阶段（questions 为空，fetch 未回）不预加载：total=0 会误判"已全部渲染"，
+  // 且可能点一次 load-older 白白加载一批历史——数据到达后本 effect 会重跑。
   useEffect(() => {
-    if (rail.visible) {
+    if (rail.visible && questions.length > 0) {
       const t = window.setTimeout(() => startBackgroundPreload(questions.length), 400)
       return () => { clearTimeout(t) }
     }
@@ -961,7 +963,7 @@ export function QuestionRail(props: PropsRuntime<'conversation.input.dock'> & Pr
     <>
       <div
         data-question-rail=""
-        onMouseEnter={() => { setMouseOnRail(true); startBackgroundPreload(rail.ticks.length) }}
+        onMouseEnter={() => { setMouseOnRail(true); if (rail.ticks.length > 0) startBackgroundPreload(rail.ticks.length) }}
         ref={(el) => {
           railElRef.current = el
           // 元素级原生点击兜底：直接命中横线元素（与 rect 判定视觉一致）
