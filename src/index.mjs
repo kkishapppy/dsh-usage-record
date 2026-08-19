@@ -94,6 +94,108 @@ export function apply(ctx, config = {}) {
   try { mkdirSync(questionsDir, { recursive: true }) } catch { /* 只读时跳过 */ }
   const questionsFile = (sid) => join(questionsDir, `${sid}.json`)
 
+  /* ---------- 会话自动标题（低资源：规则摘要 + 离开后固化） ----------
+   * 标题 = 会话「最后一次真实提问」的摘要（≤30 字；<8 字自动并入更早一条）。
+   * 时序：对话进行中只记录「最后提问时刻 + 待固化标题」，列表保持稳定
+   * （显示上次固化结果，不随每句话跳动）；会话闲置 ≥ titleIdleMinutes
+   * （默认 2 分钟，可配）才固化标题并落盘，此后不变，直到该会话再有
+   * 新提问并再次闲置。不调 LLM、不联网；单定时器扫内存 Map，零负担。
+   * 手动命名覆盖表 dataDir/titles.json：{ [sessionId]: "名称" } 优先。
+   */
+  const titleIdleMs = Math.max(0, Number(config.titleIdleMinutes ?? 30)) * 60_000
+  const titleHostileIds = new Set() // sid（有未固化新提问）
+  const lastQuestionAt = new Map() // sid -> ms
+  const stableTitle = new Map() // sid -> 已固化标题（持久）
+  const MANUAL_TITLES_FILE = join(dataDir, 'titles.json')
+  const STABLE_TITLES_FILE = join(dataDir, 'session-titles.json')
+  let manualTitles = {}
+  try {
+    if (existsSync(MANUAL_TITLES_FILE)) {
+      const raw = JSON.parse(readFileSync(MANUAL_TITLES_FILE, 'utf8'))
+      if (raw && typeof raw === 'object') manualTitles = raw
+    }
+    if (existsSync(STABLE_TITLES_FILE)) {
+      const raw = JSON.parse(readFileSync(STABLE_TITLES_FILE, 'utf8'))
+      if (raw && typeof raw === 'object') {
+        for (const [sid, title] of Object.entries(raw)) {
+          if (typeof sid === 'string' && typeof title === 'string' && title.trim() !== '') {
+            stableTitle.set(sid, title)
+          }
+        }
+      }
+    }
+  } catch { /* 覆盖表/固化表损坏时忽略 */ }
+
+  function summarizeTitle(text) {
+    let t = String(text ?? '').replace(/\s+/g, ' ').trim()
+    if (t === '') return null
+    if (t.length > 30) t = t.slice(0, 30) + '…'
+    return t
+  }
+  /** 固化前的候选标题：最后一条提问；太短时并入更早一条（cd 冷会话从索引取）。 */
+  function candidateTitleFor(sid) {
+    const q = questionCache.get(sid)
+    const list = (q && q.list) || readQuestionIndex(sid) || null
+    if (!list || list.length === 0) return null
+    let t = list[list.length - 1].text ?? ''
+    if (t.length < 8 && list.length > 1) {
+      t = [list[list.length - 2].text ?? '', t].join(' ')
+    }
+    return summarizeTitle(t)
+  }
+
+  function persistStableTitles() {
+    try {
+      if (stableTitle.size === 0) return
+      const obj = {}
+      for (const [sid, title] of stableTitle) obj[sid] = title
+      writeFileSync(STABLE_TITLES_FILE, JSON.stringify(obj), 'utf8')
+    } catch { /* 固化表写失败不阻塞 */ }
+  }
+
+  /** 定时固化：闲置超时的会话出标题（离开对话才开始计时）。 */
+  const titleTimer = setInterval(() => {
+    const now = Date.now()
+    let changed = false
+    for (const sid of titleHostileIds) {
+      const lastTs = lastQuestionAt.get(sid)
+      if (lastTs === undefined || now - lastTs >= titleIdleMs) {
+        const title = candidateTitleFor(sid)
+        if (title) {
+          stableTitle.set(sid, title)
+          changed = true
+        }
+        titleHostileIds.delete(sid)
+      }
+    }
+    if (changed) persistStableTitles()
+  }, 60_000)
+  if (titleIdleMs === 0) titleTimer.unref()
+
+  // 包装 sessionPersistence.list()：每行补 title（人工名称 > 已固化标题 > 保留已有）。
+  // 包装 sessionPersistence.list()：每行补 title（人工名称 > 已固化标题 > 保留已有）。
+  // 进行中的会话返回上次固化标题（稳定不跳）；核心会话列表读取 row.title。
+  const originalList = typeof ctx.sessionPersistence?.list === 'function'
+    ? ctx.sessionPersistence.list.bind(ctx.sessionPersistence)
+    : null
+  if (originalList) {
+    ctx.sessionPersistence.list = async (...args) => {
+      const result = await originalList(...args)
+      const rows = Array.isArray(result) ? result : (result && Array.isArray(result.rows) ? result.rows : null)
+      if (!rows) return result
+      const decorated = rows.map((row) => {
+        if (!row || typeof row !== 'object') return row
+        const sid = row.id ?? row.sessionId
+        if (typeof sid !== 'string' || sid === '') return row
+        if (row.title && String(row.title).trim() !== '') return row
+        const title = manualTitles[sid] || stableTitle.get(sid)
+        if (!title) return row
+        return { ...row, title }
+      })
+      return Array.isArray(result) ? decorated : { ...result, rows: decorated }
+    }
+  }
+
   /** Read the persisted question index for a session, if present. */
   function readQuestionIndex(sid) {
     try {
@@ -148,6 +250,9 @@ export function apply(ctx, config = {}) {
               q.list.push(question)
               q.version += 1
               questionCache.set(sid, q)
+              // 标题逻辑：记录最后提问时刻并标记待固化，标题在闲置后才更新（进行中保持稳定）
+              lastQuestionAt.set(sid, t)
+              titleHostileIds.add(sid)
               wakeQuestionWaiters(sid)
               appendQuestionIndex(sid, question)
             }
@@ -378,6 +483,8 @@ export function apply(ctx, config = {}) {
 
   return () => {
     clearTimeout(saveTimer)
+    clearInterval(titleTimer)
+    persistStableTitles()
     disposeRecords()
     disposeQuestions()
     disposeQuestionsWait()
