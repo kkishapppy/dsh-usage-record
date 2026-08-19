@@ -15,7 +15,9 @@ DSH Web 对话区**左侧提问导航轨**：每条横线 = 一次提问，点�
 ## 安装
 
 ```bash
-dsh plugin --profile web add dsh-usage-record
+# 从 GitHub Release 安装（推荐）
+dsh plugin --profile web add https://github.com/kkishapppy/dsh-usage-record/releases/download/v0.1.0/dsh-usage-record-0.1.0.tgz
+# 或本地 tgz：dsh plugin --profile web add ./dsh-usage-record-0.1.0.tgz
 ```
 
 配置（`profiles/<profile>/cordis.patch.yml`，可选）：
